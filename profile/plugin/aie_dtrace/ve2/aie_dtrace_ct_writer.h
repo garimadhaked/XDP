@@ -38,7 +38,9 @@ struct CTCounterInfo {
   uint8_t column;
   uint8_t row;
   uint8_t counterNumber;
-  uint8_t channel;            // DMA channel number (0 or 1) for bandwidth metrics
+  uint8_t channel;            // GMIO DMA channel (0 or 1)
+  uint8_t streamId;         // PLIO SOUTH stream_id from metadata
+  bool isPlioPort = false;
   std::string module;
   uint64_t address;
   std::string metricSet;      // Metric set name for this counter
@@ -88,9 +90,11 @@ struct CTRegisterWrite {
  */
 struct BandwidthCounterConfig {
   uint8_t counterNumber;   // Counter number (0-3)
-  uint8_t channel;         // DMA channel number (0 or 1)
+  uint8_t channel;         // GMIO DMA channel (0 or 1)
+  uint8_t streamId;        // PLIO SOUTH stream_id from metadata
   uint8_t dmaPortIndex;    // Physical port index for stream switch (VE2-specific)
   bool isMaster;           // true=S2MM/output (master), false=MM2S/input (slave)
+  bool isPlioPort;         // true=PLIO SOUTH port, false=GMIO NoC0 DMA channel
   std::string direction;   // "input" (MM2S) or "output" (S2MM)
   std::string eventType;   // "running" or "stalled"
 };

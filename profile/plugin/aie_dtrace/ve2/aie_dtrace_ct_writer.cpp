@@ -724,10 +724,10 @@ std::vector<BandwidthCounterConfig> AieDtraceCTWriter::getBandwidthCounterConfig
     std::string starvationType   = isWrite ? "stream_starvation"   : "memory_starvation";
     std::string backpressureType = isWrite ? "memory_backpressure" : "stream_backpressure";
     return {
-      {0, ch, runPortIndex, isMaster, dir, "running"},
-      {1, ch, 0, isMaster, dir, "lock"},
-      {2, ch, 0, isMaster, dir, starvationType},
-      {3, ch, 0, isMaster, dir, backpressureType}
+      {0, ch, 0, runPortIndex, isMaster, false, dir, "running"},
+      {1, ch, 0, 0, isMaster, false, dir, "lock"},
+      {2, ch, 0, 0, isMaster, false, dir, starvationType},
+      {3, ch, 0, 0, isMaster, false, dir, backpressureType}
     };
   }
 
@@ -735,27 +735,30 @@ std::vector<BandwidthCounterConfig> AieDtraceCTWriter::getBandwidthCounterConfig
     std::vector<BandwidthCounterConfig> configs;
     uint8_t counterNum = 0;
 
-    auto addPeakPair = [&](uint8_t ch, uint8_t portIdx, bool isMaster) {
+    auto addPeakPair = [&](uint8_t ch, uint8_t streamId, uint8_t portIdx,
+                           bool isMaster, bool isPlio) {
       if (counterNum >= NUM_BANDWIDTH_COUNTERS)
         return;
       std::string dir = isMaster ? "output" : "input";
-      configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "running"});
+      configs.push_back({counterNum++, ch, streamId, portIdx, isMaster, isPlio, dir, "running"});
       if (counterNum >= NUM_BANDWIDTH_COUNTERS)
         return;
-      configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "stalled"});
+      configs.push_back({counterNum++, ch, streamId, portIdx, isMaster, isPlio, dir, "stalled"});
     };
 
     // GMIO NoC0 DMA channels (mm2s/s2mm names in metadata)
     auto dmaChannels = getUsedGmioDmaChannels(tile, metricSet, channel);
     for (const auto& dma : dmaChannels) {
-      addPeakPair(dma.channel, getVe2DmaPortIndex(dma.isMaster, dma.channel), dma.isMaster);
+      addPeakPair(dma.channel, 0, getVe2DmaPortIndex(dma.isMaster, dma.channel),
+                  dma.isMaster, false);
     }
 
     // PLIO SOUTH stream ports (stream_ids in metadata): PORT_RUNNING + PORT_STALLED
     if (configs.empty()) {
       auto plioPorts = getUsedPlioStreamPorts(tile, metricSet);
-      for (const auto& port : plioPorts)
-        addPeakPair(port.streamId, port.streamId, port.isMaster);
+      for (const auto& port : plioPorts) {
+        addPeakPair(0, port.streamId, port.streamId, port.isMaster, true);
+      }
     }
 
     return configs;
@@ -772,7 +775,7 @@ std::vector<BandwidthCounterConfig> AieDtraceCTWriter::getBandwidthCounterConfig
       break;
     std::string dir = dma.isMaster ? "output" : "input";
     uint8_t portIdx = getVe2DmaPortIndex(dma.isMaster, dma.channel);
-    configs.push_back({counterNum++, dma.channel, portIdx, dma.isMaster, dir, "running"});
+    configs.push_back({counterNum++, dma.channel, 0, portIdx, dma.isMaster, false, dir, "running"});
   }
 
   return configs;
@@ -954,6 +957,8 @@ std::vector<CTCounterInfo> AieDtraceCTWriter::generateBandwidthCountersForTile(
     info.row = SHIM_ROW;
     info.counterNumber = cfg.counterNumber;
     info.channel = cfg.channel;
+    info.streamId = cfg.streamId;
+    info.isPlioPort = cfg.isPlioPort;
     info.module = "interface_tile";
     info.address = calculateCounterAddress(column, SHIM_ROW, cfg.counterNumber, "interface_tile");
     info.metricSet = metricSet;
@@ -1018,9 +1023,14 @@ bool AieDtraceCTWriter::writeBandwidthCTFile(
       const auto& ctr = asmFileInfo.counters[c];
       ctFile << "#     {\"col\": " << static_cast<int>(ctr.column)
              << ", \"row\": " << static_cast<int>(ctr.row)
-             << ", \"ctr\": " << static_cast<int>(ctr.counterNumber)
-             << ", \"ch\": " << static_cast<int>(ctr.channel)
-             << ", \"dir\": ";
+             << ", \"ctr\": " << static_cast<int>(ctr.counterNumber);
+
+      if (ctr.isPlioPort)
+        ctFile << ", \"stream_id\": " << static_cast<int>(ctr.streamId);
+      else
+        ctFile << ", \"ch\": " << static_cast<int>(ctr.channel);
+
+      ctFile << ", \"dir\": ";
 
       if (ctr.portDirection == "input")
         ctFile << "\"i\"";
