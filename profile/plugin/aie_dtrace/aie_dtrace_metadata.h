@@ -35,6 +35,9 @@ class AieDtraceMetadata {
     std::vector<std::map<tile_type, std::string>> configMetrics;
     std::map<tile_type, uint8_t> configChannel0;
     std::map<tile_type, uint8_t> configChannel1;
+    // South<N> ports (max 2) to monitor per PLIO interface tile, sourced from
+    // plip_info.json (or the user's ":<ch0>[:<ch1>]" metric suffix override).
+    std::map<tile_type, std::vector<uint8_t>> configPlioChannels;
 
     const aie::BaseFiletypeImpl* metadataReader = nullptr;
 
@@ -43,6 +46,10 @@ class AieDtraceMetadata {
                                            const std::vector<std::string>& metricsSettings);
     void getConfigMetricsForAIETiles(int moduleIdx,
                                       const std::vector<std::string>& metricsSettings);
+    // Populate configMetrics for plio_read/write_bandwidth from plip_info.json.
+    // Returns true when the setting was a PLIO metric and has been handled here
+    // (so the generic column/channel passes should skip it).
+    bool addPlioBandwidthTiles(int moduleIdx, const std::vector<std::string>& tokens);
     bool isBandwidthMetricSet(const std::string& metricSet) const;
     bool isCoreMetricSet(const std::string& metricSet) const;
 
@@ -72,6 +79,9 @@ class AieDtraceMetadata {
     // DMA channel selected by each interface tile metric's ":<channel>" suffix;
     // used by detailed_ddr_*_bandwidth to pick the MM2S/S2MM channel to monitor.
     std::map<tile_type, uint8_t> getConfigChannel0() { return configChannel0; }
+
+    // South<N> ports to monitor for each PLIO interface tile (plio_*_bandwidth).
+    std::map<tile_type, std::vector<uint8_t>> getConfigPlioChannels() { return configPlioChannels; }
 
     int getHardwareGen() const {
       return metadataReader == nullptr ? 0 : metadataReader->getHardwareGeneration();

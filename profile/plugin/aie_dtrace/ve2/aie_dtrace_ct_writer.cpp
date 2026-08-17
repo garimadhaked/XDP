@@ -5,6 +5,7 @@
 
 #include "xdp/profile/plugin/aie_dtrace/ve2/aie_dtrace_ct_writer.h"
 #include "xdp/profile/plugin/aie_dtrace/aie_dtrace_metadata.h"
+#include "xdp/profile/plugin/aie_dtrace/util/aie_dtrace_util.h"
 #include "xdp/profile/database/database.h"
 #include "xdp/profile/database/static_info/aie_constructs.h"
 #include "xdp/profile/database/static_info/aie_util.h"
@@ -1136,6 +1137,8 @@ bool AieDtraceCTWriter::writeCounterCTFile(
           ctFile << "\"r\"";
         else if (ctr.eventType == "stalled")
           ctFile << "\"s\"";
+        else if (ctr.eventType == "window")
+          ctFile << "\"w\"";
         else
           ctFile << "\"" << ctr.eventType << "\"";
       }
@@ -1254,6 +1257,11 @@ bool AieDtraceCTWriter::appendBandwidthConfig(
     void* hwctx, const std::string& metricSet, uint8_t channel,
     std::vector<CTCounterInfo>& counters, std::vector<CTRegisterWrite>& beginWrites)
 {
+  // PLIO SOUTH-port bandwidth is driven by plip_info.json columns, not the
+  // partition shim columns, so it has its own path.
+  if (xdp::aie::dtrace::isPlioBandwidthMetric(metricSet))
+    return appendPlioBandwidthConfig(metricSet, counters, beginWrites);
+
   auto shimColumns = getShimTileColumns(hwctx);
   if (shimColumns.empty()) {
     xrt_core::message::send(severity_level::warning, "XRT",
@@ -1280,6 +1288,213 @@ bool AieDtraceCTWriter::appendBandwidthConfig(
   }
 
   return true;
+}
+
+std::vector<BandwidthCounterConfig> AieDtraceCTWriter::getPlioBandwidthCounterConfigs(
+    const std::vector<uint8_t>& channels, bool isWrite)
+{
+  // read = slave/input south port, write = master/output south port.
+  const bool isMaster = isWrite;
+  const std::string dir = isWrite ? "output" : "input";
+
+  std::vector<BandwidthCounterConfig> configs;
+  uint8_t counterNum = 0;
+  for (uint8_t ch : channels) {
+    if (counterNum + PLIO_COUNTERS_PER_STREAM > NUM_SHIM_PERF_COUNTERS)
+      break;
+    uint8_t portIdx = xdp::aie::dtrace::getPlioSouthStreamPortIndex(ch);
+    // Three counters per stream: window (combo -> tlast), running, stalled.
+    configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "window"});
+    configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "running"});
+    configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "stalled"});
+  }
+  return configs;
+}
+
+std::vector<CTRegisterWrite> AieDtraceCTWriter::generatePlioStreamSwitchPortConfig(
+    uint8_t column, const std::vector<BandwidthCounterConfig>& configs)
+{
+  std::vector<CTRegisterWrite> writes;
+  if (configs.empty())
+    return writes;
+
+  uint64_t tileAddress = (static_cast<uint64_t>(column) << columnShift) |
+                         (static_cast<uint64_t>(SHIM_ROW) << rowShift);
+  uint64_t regAddr = tileAddress + STREAM_SWITCH_EVENT_PORT_SEL_OFFSET;
+
+  // One monitor slot per stream; the "window" config is the first of each triple.
+  uint32_t regValue = 0;
+  size_t slot = 0;
+  for (const auto& cfg : configs) {
+    if (cfg.eventType != "window")
+      continue;
+    if (slot >= PORTS_PER_REGISTER)
+      break;
+    uint8_t bitOffset = static_cast<uint8_t>(slot) * 8;
+    uint8_t slaveOrMaster = cfg.isMaster ? 1 : 0;
+    regValue |= (static_cast<uint32_t>(cfg.dmaPortIndex) << bitOffset)
+              | (static_cast<uint32_t>(slaveOrMaster) << (bitOffset + 5));
+    ++slot;
+  }
+
+  CTRegisterWrite write;
+  write.address = regAddr;
+  write.value = regValue;
+  write.comment = "PLIO SS port sel @ col " + std::to_string(column) + " (south ports)";
+  writes.push_back(write);
+  return writes;
+}
+
+std::vector<CTRegisterWrite> AieDtraceCTWriter::generatePlioPerfCounterConfig(
+    uint8_t column, const std::vector<BandwidthCounterConfig>& configs)
+{
+  std::vector<CTRegisterWrite> writes;
+  if (configs.empty())
+    return writes;
+
+  uint64_t tileAddress = (static_cast<uint64_t>(column) << columnShift) |
+                         (static_cast<uint64_t>(SHIM_ROW) << rowShift);
+
+  // AIE2PS shim PL stream-switch port events (per monitor slot s): base + 4*s.
+  constexpr uint8_t PORT_RUNNING_BASE = 134;  // XAIE2PS_EVENTS_PL_STREAM_SWITCH_PORT_RUNNING_0
+  constexpr uint8_t PORT_STALLED_BASE = 135;
+  constexpr uint8_t PORT_TLAST_BASE   = 136;
+  constexpr uint8_t COMBO_EVENT_BASE  = 7;    // XAIE2PS_EVENTS_PL_COMBO_EVENT_0
+  auto runningEvent = [](uint8_t s) { return static_cast<uint8_t>(PORT_RUNNING_BASE + s * 4); };
+  auto stalledEvent = [](uint8_t s) { return static_cast<uint8_t>(PORT_STALLED_BASE + s * 4); };
+  auto tlastEvent   = [](uint8_t s) { return static_cast<uint8_t>(PORT_TLAST_BASE + s * 4); };
+
+  // Reset all six shim performance counters.
+  for (uint8_t i = 0; i < NUM_SHIM_PERF_COUNTERS; ++i) {
+    CTRegisterWrite write;
+    write.address = tileAddress + PERF_COUNTER0_OFFSET + (i * 4);
+    write.value = 0;
+    write.comment = "Reset PerfCounter" + std::to_string(i) + " @ col " + std::to_string(column);
+    writes.push_back(write);
+  }
+
+  const uint8_t numPorts =
+      std::min<uint8_t>(static_cast<uint8_t>(configs.size() / PLIO_COUNTERS_PER_STREAM),
+                        MAX_PLIO_STREAM_PORTS);
+
+  // Combo events: combo0 = running0 | stalled0, combo1 = running1 | stalled1.
+  // These OR the port's running/stalled events into a single "activity" event that
+  // starts each stream's window counter.
+  {
+    uint32_t inputs = 0;
+    inputs |= static_cast<uint32_t>(runningEvent(0)) << 0;   // EventA
+    inputs |= static_cast<uint32_t>(stalledEvent(0)) << 8;   // EventB
+    if (numPorts > 1) {
+      inputs |= static_cast<uint32_t>(runningEvent(1)) << 16; // EventC
+      inputs |= static_cast<uint32_t>(stalledEvent(1)) << 24; // EventD
+    }
+    CTRegisterWrite w;
+    w.address = tileAddress + COMBO_EVENT_INPUTS_OFFSET;
+    w.value = inputs;
+    w.comment = "Combo event inputs @ col " + std::to_string(column) + " (running|stalled per port)";
+    writes.push_back(w);
+
+    uint32_t control = COMBO_EVENT_OR_OP << 0;              // COMBO0 = A OR B
+    if (numPorts > 1)
+      control |= COMBO_EVENT_OR_OP << 8;                    // COMBO1 = C OR D
+    CTRegisterWrite wc;
+    wc.address = tileAddress + COMBO_EVENT_CONTROL_OFFSET;
+    wc.value = control;
+    wc.comment = "Combo event control @ col " + std::to_string(column) + " (OR)";
+    writes.push_back(wc);
+  }
+
+  // Per-pair start/stop control registers (counters 0/1, 2/3, 4/5).
+  static constexpr uint64_t PERF_CTRL_STARTSTOP_OFFSET[3] = {0x00031000, 0x0003100C, 0x00031014};
+  std::map<uint64_t, uint32_t> ctrlValues;
+
+  auto setCounter = [&](uint8_t counter, uint8_t startEvent, uint8_t stopEvent) {
+    uint64_t offset = PERF_CTRL_STARTSTOP_OFFSET[counter / 2];
+    bool highHalf = (counter % 2) != 0;
+    uint8_t startShift = highHalf ? 16 : 0;
+    uint8_t stopShift  = highHalf ? 24 : 8;
+    ctrlValues[offset] |= (static_cast<uint32_t>(startEvent) & 0xFF) << startShift;
+    ctrlValues[offset] |= (static_cast<uint32_t>(stopEvent)  & 0xFF) << stopShift;
+  };
+
+  for (uint8_t p = 0; p < numPorts; ++p) {
+    uint8_t slot = p;  // Monitor slot p selects the p-th configured PLIO port.
+    uint8_t windowCounter  = static_cast<uint8_t>(p * PLIO_COUNTERS_PER_STREAM + 0);
+    uint8_t runningCounter = static_cast<uint8_t>(p * PLIO_COUNTERS_PER_STREAM + 1);
+    uint8_t stalledCounter = static_cast<uint8_t>(p * PLIO_COUNTERS_PER_STREAM + 2);
+
+    // Window: start on combo (running|stalled), stop on TLAST.
+    setCounter(windowCounter, static_cast<uint8_t>(COMBO_EVENT_BASE + p), tlastEvent(slot));
+    // Running-event count: start == stop == PORT_RUNNING.
+    setCounter(runningCounter, runningEvent(slot), runningEvent(slot));
+    // Stalled-event count: start == stop == PORT_STALLED.
+    setCounter(stalledCounter, stalledEvent(slot), stalledEvent(slot));
+  }
+
+  for (const auto& [offset, value] : ctrlValues) {
+    CTRegisterWrite w;
+    w.address = tileAddress + offset;
+    w.value = value;
+    w.comment = "PLIO PerfCtrl " + formatAddress(offset) + " @ col " + std::to_string(column);
+    writes.push_back(w);
+  }
+
+  return writes;
+}
+
+bool AieDtraceCTWriter::appendPlioBandwidthConfig(
+    const std::string& metricSet,
+    std::vector<CTCounterInfo>& counters, std::vector<CTRegisterWrite>& beginWrites)
+{
+  auto plioChannels = metadata->getConfigPlioChannels();
+  if (plioChannels.empty()) {
+    xrt_core::message::send(severity_level::warning, "XRT",
+        "AIE dtrace: No PLIO columns configured for " + metricSet + ".");
+    return false;
+  }
+
+  const bool isWrite = (metricSet == "plio_write_bandwidth");
+  bool appended = false;
+
+  for (const auto& [tile, channels] : plioChannels) {
+    // plip_info.json columns are absolute; the CT file uses partition-relative columns.
+    uint8_t relCol = (tile.col >= partitionStartCol)
+                   ? static_cast<uint8_t>(tile.col - partitionStartCol) : tile.col;
+
+    std::vector<uint8_t> chans = channels;
+    if (chans.empty())
+      chans = {0, 1};
+    if (chans.size() > MAX_PLIO_STREAM_PORTS)
+      chans.resize(MAX_PLIO_STREAM_PORTS);
+
+    auto configs = getPlioBandwidthCounterConfigs(chans, isWrite);
+    if (configs.empty())
+      continue;
+
+    for (const auto& cfg : configs) {
+      CTCounterInfo info;
+      info.column = relCol;
+      info.row = SHIM_ROW;
+      info.counterNumber = cfg.counterNumber;
+      info.channel = cfg.channel;   // south port number
+      info.module = "interface_tile";
+      info.address = calculateCounterAddress(relCol, SHIM_ROW, cfg.counterNumber, "interface_tile");
+      info.metricSet = metricSet;
+      info.portDirection = cfg.direction;
+      info.eventType = cfg.eventType;
+      counters.push_back(info);
+    }
+
+    auto ssWrites = generatePlioStreamSwitchPortConfig(relCol, configs);
+    beginWrites.insert(beginWrites.end(), ssWrites.begin(), ssWrites.end());
+
+    auto pcWrites = generatePlioPerfCounterConfig(relCol, configs);
+    beginWrites.insert(beginWrites.end(), pcWrites.begin(), pcWrites.end());
+
+    appended = true;
+  }
+
+  return appended;
 }
 
 void AieDtraceCTWriter::appendComputeIoBoundConfig(

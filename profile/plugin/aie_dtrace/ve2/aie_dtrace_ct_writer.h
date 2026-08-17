@@ -339,6 +339,35 @@ private:
       std::vector<CTCounterInfo>& counters, std::vector<CTRegisterWrite>& beginWrites);
 
   /**
+   * @brief Append PLIO SOUTH-port bandwidth counters and begin-block writes
+   *
+   * PLIO columns and south channels come from plip_info.json (via metadata), not
+   * the partition shim columns. Each selected south port gets three counters:
+   * a window counter (combo PORT_RUNNING|PORT_STALLED start, PORT_TLAST stop),
+   * a running-event counter and a stalled-event counter. Up to two ports fit in
+   * the six shim performance counters.
+   *
+   * @param metricSet plio_read_bandwidth (slave) or plio_write_bandwidth (master)
+   * @param counters [in,out] Accumulated counter list
+   * @param beginWrites [in,out] Accumulated begin-block register writes
+   * @return true if any PLIO bandwidth config was appended
+   */
+  bool appendPlioBandwidthConfig(const std::string& metricSet,
+      std::vector<CTCounterInfo>& counters, std::vector<CTRegisterWrite>& beginWrites);
+
+  // Build the (up to 6) PLIO counter configs for one shim column's south channels.
+  std::vector<BandwidthCounterConfig> getPlioBandwidthCounterConfigs(
+      const std::vector<uint8_t>& channels, bool isWrite);
+
+  // Stream-switch event-port selection for the PLIO south ports (one slot per stream).
+  std::vector<CTRegisterWrite> generatePlioStreamSwitchPortConfig(uint8_t column,
+      const std::vector<BandwidthCounterConfig>& configs);
+
+  // Combo events + per-pair perf control for the PLIO 3-counters-per-stream scheme.
+  std::vector<CTRegisterWrite> generatePlioPerfCounterConfig(uint8_t column,
+      const std::vector<BandwidthCounterConfig>& configs);
+
+  /**
    * @brief Append the compute_io_bound counters and begin-block writes
    * @param counters [in,out] Accumulated counter list
    * @param beginWrites [in,out] Accumulated begin-block register writes
@@ -486,6 +515,20 @@ private:
   static constexpr uint8_t NUM_BANDWIDTH_COUNTERS = 4;
   static constexpr uint8_t SHIM_ROW = 0;
   static constexpr uint8_t PORTS_PER_REGISTER = 4;
+
+  // PLIO combo-event offsets (AIE2PS shim PL module).
+  static constexpr uint64_t COMBO_EVENT_INPUTS_OFFSET  = 0x00034400;  // EventA/B/C/D
+  static constexpr uint64_t COMBO_EVENT_CONTROL_OFFSET = 0x00034404;  // COMBO0[1:0], COMBO1[9:8]
+  static constexpr uint32_t COMBO_EVENT_OR_OP = 2;  // E1 OR E2
+
+  // First shim performance counter value register (counters at +4 up to counter 5).
+  static constexpr uint64_t PERF_COUNTER0_OFFSET = 0x00031020;
+  static constexpr uint8_t  NUM_SHIM_PERF_COUNTERS = 6;
+
+  // PLIO bandwidth: 3 counters per stream (window, running, stalled); the six shim
+  // counters allow up to two PLIO south ports simultaneously.
+  static constexpr uint8_t PLIO_COUNTERS_PER_STREAM = 3;
+  static constexpr uint8_t MAX_PLIO_STREAM_PORTS = 2;
 
   // Output filename
   static constexpr const char* CT_OUTPUT_FILENAME = "aie_profile.ct";
