@@ -222,14 +222,28 @@ namespace xdp {
     }
 
     for (auto& [col, jsonChannels] : columnChannels) {
-      // Precedence: user-specified channels > JSON-declared channels > default {0,1}.
-      std::vector<uint8_t> channels = userChannels;
-      if (channels.empty())
+      // Only channels present in the parsed metadata are ever monitored (no invented
+      // fallback). Without a suffix we take the column's first two metadata channels;
+      // ":<chA>[:<chB>]" selects specific metadata channels (e.g. to cover the rest of
+      // a column that declares more than two channels across separate runs).
+      std::vector<uint8_t> channels;
+      if (userChannels.empty()) {
         channels = jsonChannels;
-      if (channels.empty())
-        channels = {0, 1};
+      }
+      else {
+        for (uint8_t ch : userChannels) {
+          if (std::find(jsonChannels.begin(), jsonChannels.end(), ch) != jsonChannels.end())
+            channels.push_back(ch);
+        }
+      }
+
       if (channels.size() > MAX_PLIO_PORTS)
         channels.resize(MAX_PLIO_PORTS);
+
+      if (channels.empty()) {
+        // Requested channels are not declared for this column in the metadata; skip it.
+        continue;
+      }
 
       tile_type tile;
       tile.col = col;

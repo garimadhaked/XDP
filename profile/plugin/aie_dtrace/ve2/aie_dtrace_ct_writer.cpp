@@ -1461,9 +1461,11 @@ bool AieDtraceCTWriter::appendPlioBandwidthConfig(
     uint8_t relCol = (tile.col >= partitionStartCol)
                    ? static_cast<uint8_t>(tile.col - partitionStartCol) : tile.col;
 
+    // Metadata only stores channels that are actually declared for this column, so
+    // there is no invented fallback here; just honor the configured (capped) set.
     std::vector<uint8_t> chans = channels;
     if (chans.empty())
-      chans = {0, 1};
+      continue;
     if (chans.size() > MAX_PLIO_STREAM_PORTS)
       chans.resize(MAX_PLIO_STREAM_PORTS);
 
