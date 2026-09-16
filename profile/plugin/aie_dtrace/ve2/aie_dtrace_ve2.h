@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,11 @@ namespace xdp {
       void computeOpLocations(void* elf_handle, const std::string& kernel_name);
 
       std::map<std::string, std::vector<aiebu::aiebu_assembler::op_loc>> m_op_locations_cache;
+
+      // run_start fires on every submission of a run object, but the CT file is
+      // a property of the run itself. Track which runs have been handled so a
+      // repeatedly started run is configured only once.
+      std::set<uint32_t> m_ct_generated_runs;
   };
 
 }
