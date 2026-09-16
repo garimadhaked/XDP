@@ -88,6 +88,9 @@ namespace xdp {
     if (!xrt_core::config::get_aie_dtrace())
       return;
 
+    if (!m_ct_generated_runs.insert(run_uid).second)
+      return;
+
     auto ctx = xrt_core::hw_context_int::create_hw_context_from_implementation(hwctx);
     auto slotIdx = static_cast<xrt_core::hwctx_handle*>(ctx)->get_slotidx();
 

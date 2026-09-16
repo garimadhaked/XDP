@@ -25,9 +25,10 @@ namespace xdp {
     // aie_dtrace_cb.cpp must NOT call these directly; it calls the
     // public XDPPlugin::run*Hook wrappers, which filter out runs
     // submitted by XDP plugins themselves before delegating here.
-    void runConstructorImpl(void* run_impl_ptr, void* hwctx, uint32_t run_uid,
-                            const std::string& kernel_name,
-                            void* elf_handle) override;
+    // CT generation is done at run start, not run construction: in the full ELF
+    // flow the hardware context is not yet fully configured when the run_impl is
+    // built, so the ELF and partition data needed for CT generation are only
+    // reliably available by the time the run is about to be submitted.
     void runStartImpl(void* run_impl_ptr, void* hwctx, uint32_t run_uid,
                       const std::string& kernel_name) override;
     void runWaitImpl(void* run_impl_ptr, void* hwctx, uint32_t run_uid,

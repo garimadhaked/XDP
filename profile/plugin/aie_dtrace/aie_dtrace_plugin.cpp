@@ -7,15 +7,20 @@
 #include "xdp/profile/plugin/aie_dtrace/util/aie_dtrace_util.h"
 
 #include "core/common/api/hw_context_int.h"
+#include "core/common/api/kernel_int.h"
+#include "core/common/api/module_int.h"
 #include "core/common/config_reader.h"
 #include "core/common/message.h"
 #include "core/common/system.h"
+#include "core/common/xdp/profile.h"
 #include "core/include/xrt/experimental/xrt-next.h"
 
 #include "xdp/profile/database/database.h"
 #include "xdp/profile/device/utility.h"
 #include "xdp/profile/device/xdp_base_device.h"
 #include "xdp/profile/plugin/vp_base/info.h"
+
+#include <sstream>
 
 #if defined(XDP_VE2_BUILD)
 #include "xdp/profile/plugin/aie_dtrace/ve2/aie_dtrace_ve2.h"
@@ -187,31 +192,42 @@ namespace xdp {
     handleToAIEDtraceImpl.erase(itr);
   }
 
-  void AieDtracePlugin::runConstructorImpl(void* run_impl_ptr, void* hwctx, uint32_t run_uid,
-                                           const std::string& kernel_name, void* elf_handle)
-  {
-    if (!xrt_core::config::get_aie_dtrace())
-      return;
-
-    auto itr = handleToAIEDtraceImpl.find(hwctx);
-    if (itr == handleToAIEDtraceImpl.end()) {
-      xrt_core::message::send(severity_level::debug, "XRT",
-                              "AIE dtrace: no implementation for hwctx in runConstructorHook");
-      return;
-    }
-    itr->second->generateCTForRun(run_impl_ptr, hwctx, run_uid, kernel_name, elf_handle);
-  }
-
   void AieDtracePlugin::runStartImpl(void* run_impl_ptr, void* hwctx, uint32_t run_uid,
                                      const std::string& kernel_name)
   {
     if (!xrt_core::config::get_aie_dtrace())
       return;
 
-    (void)run_impl_ptr;
-    (void)hwctx;
-    (void)run_uid;
-    (void)kernel_name;
+    {
+      std::stringstream msg;
+      msg << "AIE dtrace: runStartHook entered for kernel '" << kernel_name
+          << "' run uid=" << run_uid << " hwctx=" << hwctx
+          << " run_impl=" << run_impl_ptr;
+      xrt_core::message::send(severity_level::debug, "XRT", msg.str());
+    }
+
+    if (!run_impl_ptr)
+      return;
+
+    auto itr = handleToAIEDtraceImpl.find(hwctx);
+    if (itr == handleToAIEDtraceImpl.end()) {
+      xrt_core::message::send(severity_level::debug, "XRT",
+                              "AIE dtrace: no implementation for hwctx in runStartHook");
+      return;
+    }
+
+    // The ELF backing this run carries the op locations that CT generation
+    // probes against. Resolve it here rather than widening the hook signature.
+    xrt_core::xdp::xrt_kernel_data data{};
+    xrt_core::kernel_int::get_xdp_kernel_data(static_cast<xrt::run_impl*>(run_impl_ptr), &data);
+    if (!data.mod) {
+      xrt_core::message::send(severity_level::debug, "XRT",
+                              "AIE dtrace: run has no module (non-ELF flow); skipping CT generation.");
+      return;
+    }
+    auto elfHandle = xrt_core::module_int::get_elf_handle(data.mod);
+
+    itr->second->generateCTForRun(run_impl_ptr, hwctx, run_uid, kernel_name, elfHandle.get());
   }
 
   void AieDtracePlugin::runWaitImpl(void* run_impl_ptr, void* hwctx, uint32_t run_uid,
