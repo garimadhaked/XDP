@@ -37,6 +37,59 @@ namespace xdp::aie::dtrace {
   // for now; see the implementation for the TODO to source the final path.
   std::vector<PlioInfoPort> parsePlioInfoJson();
 
+  // ============================ Partition geometry ===========================
+
+  // The columns one hardware context owns.
+  struct PartitionGeometry {
+    bool valid = false;
+    uint8_t startCol = 0;
+    uint32_t numCols = 0;
+  };
+
+  // Resolves the partition belonging to this hardware context. The underlying
+  // aie_partition_info query is device-wide, so it also reports partitions of
+  // other contexts and other processes; picking the wrong one puts every
+  // counter address in the CT file in somebody else's columns.
+  PartitionGeometry getPartitionGeometry(void* hwctx);
+
+  // ===========================L2L2 transfer metrics ==========================================
+
+  // Inter-stamp memtile halo dst paths; design points come from xrt.ini.
+  // Max dst halo paths per memtile column (4 perf counters, running+stalled per path).
+  static constexpr uint8_t L2L2_MAX_DST_PATHS_PER_COLUMN = 2;
+  // Memtile row 1 (absolute array row 1; row 0 = shim/interface tile).
+  static constexpr uint8_t MEM_TILE_ROW_START = 1;
+
+  struct L2L2InstrumentPoint {
+    uint8_t column = 0;
+    uint8_t dstPort = 1;
+  };
+
+  // One perf counter at a memtile dst halo path (running or stalled).
+  struct L2L2CounterPoint {
+    uint8_t column = 0;
+    uint8_t row = 0;
+    uint8_t portIndex = 1;       // halo dst port (1 = from left neighbor, 2 = from right)
+    uint8_t counterNumber = 0;   // memtile perf counter 0-3 on this tile
+    std::string eventType;         // "running" or "stalled"
+  };
+
+  // Parses memory_tile_input_ports, e.g. "{1,1:2},{5,1:1},{5,1:2}".
+  // Column is partition-relative (0 = partition start_col); row is ignored.
+  std::vector<L2L2InstrumentPoint> parseL2L2DesignPoints(const std::string& spec);
+
+  // Builds running+stalled counter pairs from design points within the partition.
+  // Columns in instrumentPoints are partition-relative (0 .. numCols-1).
+  std::vector<L2L2CounterPoint> getL2L2CounterPoints(
+      uint32_t numCols,
+      const std::vector<L2L2InstrumentPoint>& instrumentPoints);
+
+  // ========================================================================================
+  // Apply JSON + coalesced dtrace_dump defaults when those keys are absent.
+  // Values already present in xrt.ini or the environment are left unchanged.
+  // Must run before XRT creates the first dtrace module (config keys lock on first read).
+  void initDtraceOutputConfig();
+
 } // namespace xdp::aie::dtrace
 
 #endif
