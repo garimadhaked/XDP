@@ -1146,8 +1146,8 @@ bool AieDtraceCTWriter::writeCounterCTFile(
           ctFile << "\"r\"";
         else if (ctr.eventType == "stalled")
           ctFile << "\"s\"";
-        else if (ctr.eventType == "window")
-          ctFile << "\"w\"";
+        else if (ctr.eventType == "tlast")
+          ctFile << "\"t\"";
         else
           ctFile << "\"" << ctr.eventType << "\"";
       }
@@ -1315,8 +1315,8 @@ std::vector<BandwidthCounterConfig> AieDtraceCTWriter::getPlioBandwidthCounterCo
     if (counterNum + PLIO_COUNTERS_PER_STREAM > NUM_SHIM_PERF_COUNTERS)
       break;
     uint8_t portIdx = xdp::aie::dtrace::getPlioSouthStreamPortIndex(ch);
-    // Three counters per stream: window (combo -> tlast), running, stalled.
-    configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "window"});
+    // Three counters per stream: TLAST, running, and stalled event counts.
+    configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "tlast"});
     configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "running"});
     configs.push_back({counterNum++, ch, portIdx, isMaster, dir, "stalled"});
   }
@@ -1334,11 +1334,11 @@ std::vector<CTRegisterWrite> AieDtraceCTWriter::generatePlioStreamSwitchPortConf
                          (static_cast<uint64_t>(SHIM_ROW) << rowShift);
   uint64_t regAddr = tileAddress + STREAM_SWITCH_EVENT_PORT_SEL_OFFSET;
 
-  // One monitor slot per stream; the "window" config is the first of each triple.
+  // One monitor slot per stream; the "tlast" config is the first of each triple.
   uint32_t regValue = 0;
   size_t slot = 0;
   for (const auto& cfg : configs) {
-    if (cfg.eventType != "window")
+    if (cfg.eventType != "tlast")
       continue;
     if (slot >= PORTS_PER_REGISTER)
       break;
@@ -1371,7 +1371,6 @@ std::vector<CTRegisterWrite> AieDtraceCTWriter::generatePlioPerfCounterConfig(
   constexpr uint8_t PORT_RUNNING_BASE = 134;  // XAIE2PS_EVENTS_PL_STREAM_SWITCH_PORT_RUNNING_0
   constexpr uint8_t PORT_STALLED_BASE = 135;
   constexpr uint8_t PORT_TLAST_BASE   = 136;
-  constexpr uint8_t COMBO_EVENT_BASE  = 7;    // XAIE2PS_EVENTS_PL_COMBO_EVENT_0
   auto runningEvent = [](uint8_t s) { return static_cast<uint8_t>(PORT_RUNNING_BASE + s * 4); };
   auto stalledEvent = [](uint8_t s) { return static_cast<uint8_t>(PORT_STALLED_BASE + s * 4); };
   auto tlastEvent   = [](uint8_t s) { return static_cast<uint8_t>(PORT_TLAST_BASE + s * 4); };
@@ -1389,33 +1388,6 @@ std::vector<CTRegisterWrite> AieDtraceCTWriter::generatePlioPerfCounterConfig(
       std::min<uint8_t>(static_cast<uint8_t>(configs.size() / PLIO_COUNTERS_PER_STREAM),
                         MAX_PLIO_STREAM_PORTS);
 
-  // Combo events: combo0 = running0 | stalled0, combo1 = running1 | stalled1.
-  // These OR the port's running/stalled events into a single "activity" event that
-  // starts each stream's window counter.
-  {
-    uint32_t inputs = 0;
-    inputs |= static_cast<uint32_t>(runningEvent(0)) << 0;   // EventA
-    inputs |= static_cast<uint32_t>(stalledEvent(0)) << 8;   // EventB
-    if (numPorts > 1) {
-      inputs |= static_cast<uint32_t>(runningEvent(1)) << 16; // EventC
-      inputs |= static_cast<uint32_t>(stalledEvent(1)) << 24; // EventD
-    }
-    CTRegisterWrite w;
-    w.address = tileAddress + COMBO_EVENT_INPUTS_OFFSET;
-    w.value = inputs;
-    w.comment = "Combo event inputs @ col " + std::to_string(column) + " (running|stalled per port)";
-    writes.push_back(w);
-
-    uint32_t control = COMBO_EVENT_OR_OP << 0;              // COMBO0 = A OR B
-    if (numPorts > 1)
-      control |= COMBO_EVENT_OR_OP << 8;                    // COMBO1 = C OR D
-    CTRegisterWrite wc;
-    wc.address = tileAddress + COMBO_EVENT_CONTROL_OFFSET;
-    wc.value = control;
-    wc.comment = "Combo event control @ col " + std::to_string(column) + " (OR)";
-    writes.push_back(wc);
-  }
-
   // Per-pair start/stop control registers (counters 0/1, 2/3, 4/5).
   static constexpr uint64_t PERF_CTRL_STARTSTOP_OFFSET[3] = {0x00031000, 0x0003100C, 0x00031014};
   std::map<uint64_t, uint32_t> ctrlValues;
@@ -1431,15 +1403,13 @@ std::vector<CTRegisterWrite> AieDtraceCTWriter::generatePlioPerfCounterConfig(
 
   for (uint8_t p = 0; p < numPorts; ++p) {
     uint8_t slot = p;  // Monitor slot p selects the p-th configured PLIO port.
-    uint8_t windowCounter  = static_cast<uint8_t>(p * PLIO_COUNTERS_PER_STREAM + 0);
+    uint8_t tlastCounter   = static_cast<uint8_t>(p * PLIO_COUNTERS_PER_STREAM + 0);
     uint8_t runningCounter = static_cast<uint8_t>(p * PLIO_COUNTERS_PER_STREAM + 1);
     uint8_t stalledCounter = static_cast<uint8_t>(p * PLIO_COUNTERS_PER_STREAM + 2);
 
-    // Window: start on combo (running|stalled), stop on TLAST.
-    setCounter(windowCounter, static_cast<uint8_t>(COMBO_EVENT_BASE + p), tlastEvent(slot));
-    // Running-event count: start == stop == PORT_RUNNING.
+    // Event counts: start == stop, so each event increments the counter.
+    setCounter(tlastCounter, tlastEvent(slot), tlastEvent(slot));
     setCounter(runningCounter, runningEvent(slot), runningEvent(slot));
-    // Stalled-event count: start == stop == PORT_STALLED.
     setCounter(stalledCounter, stalledEvent(slot), stalledEvent(slot));
   }
 

@@ -138,12 +138,9 @@ namespace xdp::aie::dtrace {
   {
     std::vector<PlioInfoPort> ports;
 
-    // TODO: The location of the PLIO overlay metadata is not finalized yet. For
-    // now we hardcode the example overlay's plip_info.json. Replace this with the
-    // real overlay path (resolved at runtime) once it is available.
+    // Tests drop plip_info.json in the directory they are launched from.
     const std::filesystem::path jsonPath =
-        "/public/bugcases/CR/1269000-1269999/1269377/wts_prefetch/"
-        "2026.1.dbg/with-profiling/overlay/plip_info.json";
+        std::filesystem::current_path() / "plip_info.json";
 
     std::error_code ec;
     if (!std::filesystem::exists(jsonPath, ec)) {

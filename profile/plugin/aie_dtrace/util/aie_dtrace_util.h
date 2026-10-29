@@ -33,8 +33,8 @@ namespace xdp::aie::dtrace {
   uint8_t getPlioSouthStreamPortIndex(uint8_t channel);
 
   // Parse the PLIO overlay metadata (plip_info.json) and return the available
-  // PLIO controller ports (column + south channel). Reads from a hardcoded path
-  // for now; see the implementation for the TODO to source the final path.
+  // PLIO controller ports (column + south channel). The file is read from the
+  // current working directory.
   std::vector<PlioInfoPort> parsePlioInfoJson();
 
   // ============================ Partition geometry ===========================
