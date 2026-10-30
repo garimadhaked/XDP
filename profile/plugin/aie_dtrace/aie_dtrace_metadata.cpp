@@ -26,7 +26,7 @@ namespace xdp {
     static const std::set<std::string> metrics = {
       "ddr_bandwidth", "read_bandwidth", "write_bandwidth",
       "peak_read_bandwidth", "peak_write_bandwidth",
-      "plio_read_bandwidth", "plio_write_bandwidth",
+      "plio_read_bandwidth",
       "detailed_ddr_read_bandwidth", "detailed_ddr_write_bandwidth", "off"};
     return metrics;
   }
