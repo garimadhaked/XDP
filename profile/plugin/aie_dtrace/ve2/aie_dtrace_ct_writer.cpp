@@ -1169,40 +1169,8 @@ bool AieDtraceCTWriter::writeCounterCTFile(
   ctFile << "@blockclose\n";
   ctFile << "}\n\n";
 
-  for (const auto& asmFileInfo : asmFileInfoList) {
-    if (asmFileInfo.timestamps.empty() || asmFileInfo.counters.empty())
-      continue;
-
-    std::string basename = fs::path(asmFileInfo.filename).filename().string();
-
-    ctFile << "# Probes for " << basename
-           << " (columns " << asmFileInfo.colStart << "-" << asmFileInfo.colEnd << ")\n";
-
-    std::stringstream lineList;
-    lineList << "line";
-    for (size_t i = 0; i < asmFileInfo.timestamps.size(); i++) {
-      if (i > 0)
-        lineList << ",";
-      lineList << asmFileInfo.timestamps[i].lineNumber;
-    }
-
-    ctFile << "jprobe:" << basename
-           << ":uc" << asmFileInfo.ucNumber
-           << ":" << lineList.str() << "\n";
-    ctFile << "{\n";
-    ctFile << "    ts_" << asmFileInfo.asmId << " = timestamp32()\n";
-
-    // Each counter is assigned a sequential result variable (_0, _1, _2, ...)
-    // so the dtrace JSON dump emits one key per counter ("_0", "_1", ...) in
-    // probe order; counter semantics live in the COUNTER_METADATA block above.
-    for (size_t i = 0; i < asmFileInfo.counters.size(); i++) {
-      const auto& ctr = asmFileInfo.counters[i];
-      ctFile << "    _" << i << " = read_reg(" << formatAddress(ctr.address) << ")\n";
-    }
-
-    ctFile << "}\n\n";
-  }
-
+  // Timestamp reads and clock-stop writes share one ascending line list.
+  // Emitting either group as its own block leaves the later group unreachable.
   writePlioReadWindowProbes(ctFile, asmFileInfoList);
 
   ctFile << "end\n";
@@ -1230,62 +1198,135 @@ void AieDtraceCTWriter::writePlioReadWindowProbes(
         anyClock = true;
     }
   }
-  if (!anyClock)
-    return;
 
-  const auto tasksByUc = xdp::aie::dtrace::parsePlWtsJson();
-
+  const auto tasksByUc = anyClock
+      ? xdp::aie::dtrace::parsePlWtsJson()
+      : std::map<int, std::vector<xdp::aie::dtrace::PlWtsProbe>>{};
   std::map<int, bool> usedUc;
+
+  // One timestamp jprobe for a contiguous run of SAVE_TIMESTAMPS lines.
+  auto writeTimestampProbe = [&](const ASMFileInfo& asmFileInfo,
+                                 const std::vector<uint32_t>& lines) {
+    if (lines.empty() || asmFileInfo.counters.empty())
+      return;
+
+    const std::string basename = fs::path(asmFileInfo.filename).filename().string();
+    ctFile << "jprobe:" << basename
+           << ":uc" << asmFileInfo.ucNumber
+           << ":line";
+    for (size_t i = 0; i < lines.size(); i++) {
+      if (i > 0)
+        ctFile << ",";
+      ctFile << lines[i];
+    }
+    ctFile << "\n{\n";
+    ctFile << "    ts_" << asmFileInfo.asmId << " = timestamp32()\n";
+    // Sequential result names (_0, _1, _2, ...) become the dump keys.
+    for (size_t i = 0; i < asmFileInfo.counters.size(); i++) {
+      ctFile << "    _" << i << " = read_reg("
+             << formatAddress(asmFileInfo.counters[i].address) << ")\n";
+    }
+    ctFile << "}\n\n";
+  };
+
+  auto writeClockProbe = [&](const ASMFileInfo& asmFileInfo,
+                             const std::vector<CTCounterInfo>& clockCounters,
+                             const xdp::aie::dtrace::PlWtsProbe& task) {
+    const std::string basename = fs::path(asmFileInfo.filename).filename().string();
+    ctFile << "# PLIO clock stop @ uc" << asmFileInfo.ucNumber
+           << " line " << task.line << " count " << task.stopCount << "\n";
+    ctFile << "jprobe:" << basename
+           << ":uc" << asmFileInfo.ucNumber
+           << ":line" << task.line << "\n";
+    ctFile << "{\n";
+    for (const auto& ctr : clockCounters) {
+      const uint64_t tileAddress = (static_cast<uint64_t>(ctr.column) << columnShift) |
+                                   (static_cast<uint64_t>(ctr.row) << rowShift);
+      // Counter 0 is the running-event counter. Its event-value is the count
+      // at which PERF_CNT_0 fires. That event is counter 2's stop.
+      const uint64_t runningEventValueAddr = tileAddress + PL_PERF_COUNTER0_EVENT_VALUE_OFFSET;
+      const uint64_t clockCtrlAddr = tileAddress + PL_PERF_CTRL2_OFFSET;
+      const uint64_t generateAddr = tileAddress + PL_EVENT_GENERATE_OFFSET;
+      const uint32_t stopField = (PL_PERF_CNT_0 << 8) & PL_COUNTER2_STOP_MASK;
+
+      ctFile << "    # running ceiling " << task.stopCount
+             << ", counter 2 stop = PERF_CNT_0, then PL User Event 1\n";
+      ctFile << "    write_reg(" << formatAddress(runningEventValueAddr) << ", 0x"
+             << std::hex << std::setfill('0') << std::setw(8) << task.stopCount
+             << std::dec << ")\n";
+      ctFile << "    mask_write_reg(" << formatAddress(clockCtrlAddr) << ", 0x"
+             << std::hex << std::setfill('0') << std::setw(8) << PL_COUNTER2_STOP_MASK
+             << ", 0x" << std::setw(8) << stopField << std::dec << ")\n";
+      ctFile << "    write_reg(" << formatAddress(generateAddr) << ", 0x"
+             << std::hex << std::setfill('0') << std::setw(8) << PL_USER_EVENT_1
+             << std::dec << ")\n";
+    }
+    ctFile << "}\n\n";
+  };
+
   for (const auto& asmFileInfo : asmFileInfoList) {
+    if (asmFileInfo.counters.empty())
+      continue;
+
     std::vector<CTCounterInfo> clockCounters;
     for (const auto& ctr : asmFileInfo.counters) {
       if (ctr.metricSet == "plio_read_bandwidth" && ctr.eventType == "clock")
         clockCounters.push_back(ctr);
     }
-    if (clockCounters.empty())
-      continue;
 
-    const auto tasks = tasksByUc.find(asmFileInfo.ucNumber);
-    if (tasks == tasksByUc.end() || tasks->second.empty()) {
-      xrt_core::message::send(severity_level::warning, "XRT",
-          "AIE dtrace: no pl_wts.json entry for UC " + std::to_string(asmFileInfo.ucNumber)
-          + "; the PLIO clock counter is not stopped.");
-      continue;
+    std::vector<xdp::aie::dtrace::PlWtsProbe> tasks;
+    if (!clockCounters.empty()) {
+      const auto found = tasksByUc.find(asmFileInfo.ucNumber);
+      if (found == tasksByUc.end() || found->second.empty()) {
+        xrt_core::message::send(severity_level::warning, "XRT",
+            "AIE dtrace: no pl_wts.json entry for UC " + std::to_string(asmFileInfo.ucNumber)
+            + "; the PLIO clock counter is not stopped.");
+      } else {
+        tasks = found->second;
+        std::stable_sort(tasks.begin(), tasks.end(),
+            [](const auto& a, const auto& b) { return a.line < b.line; });
+        usedUc[asmFileInfo.ucNumber] = true;
+      }
     }
-    usedUc[asmFileInfo.ucNumber] = true;
+
+    std::vector<uint32_t> timestampLines;
+    timestampLines.reserve(asmFileInfo.timestamps.size());
+    for (const auto& ts : asmFileInfo.timestamps)
+      timestampLines.push_back(ts.lineNumber);
+    std::sort(timestampLines.begin(), timestampLines.end());
+
+    if (timestampLines.empty() && tasks.empty())
+      continue;
 
     const std::string basename = fs::path(asmFileInfo.filename).filename().string();
-    for (const auto& task : tasks->second) {
-      ctFile << "# PLIO clock stop @ uc" << asmFileInfo.ucNumber
-             << " line " << task.line << " count " << task.stopCount << "\n";
-      ctFile << "jprobe:" << basename
-             << ":uc" << asmFileInfo.ucNumber
-             << ":line" << task.line << "\n";
-      ctFile << "{\n";
-      for (const auto& ctr : clockCounters) {
-        const uint64_t tileAddress = (static_cast<uint64_t>(ctr.column) << columnShift) |
-                                     (static_cast<uint64_t>(ctr.row) << rowShift);
-        // Counter 0 is the running-event counter. Its event-value is the count
-        // at which PERF_CNT_0 fires. That event is counter 2's stop.
-        const uint64_t runningEventValueAddr = tileAddress + PL_PERF_COUNTER0_EVENT_VALUE_OFFSET;
-        const uint64_t clockCtrlAddr = tileAddress + PL_PERF_CTRL2_OFFSET;
-        const uint64_t generateAddr = tileAddress + PL_EVENT_GENERATE_OFFSET;
-        const uint32_t stopField = (PL_PERF_CNT_0 << 8) & PL_COUNTER2_STOP_MASK;
+    ctFile << "# Probes for " << basename
+           << " (columns " << asmFileInfo.colStart << "-" << asmFileInfo.colEnd << ")\n";
 
-        ctFile << "    # running ceiling " << task.stopCount
-               << ", counter 2 stop = PERF_CNT_0, then PL User Event 0\n";
-        ctFile << "    write_reg(" << formatAddress(runningEventValueAddr) << ", 0x"
-               << std::hex << std::setfill('0') << std::setw(8) << task.stopCount
-               << std::dec << ")\n";
-        ctFile << "    mask_write_reg(" << formatAddress(clockCtrlAddr) << ", 0x"
-               << std::hex << std::setfill('0') << std::setw(8) << PL_COUNTER2_STOP_MASK
-               << ", 0x" << std::setw(8) << stopField << std::dec << ")\n";
-        ctFile << "    write_reg(" << formatAddress(generateAddr) << ", 0x"
-               << std::hex << std::setfill('0') << std::setw(8) << PL_USER_EVENT_0
-               << std::dec << ")\n";
+    // Merge the two line lists. A clock-stop line equal to a timestamp line is
+    // emitted first, so the ceiling and the user event are programmed before
+    // the counters are read.
+    size_t timestampIndex = 0;
+    size_t taskIndex = 0;
+    std::vector<uint32_t> timestampRun;
+    auto flushTimestampRun = [&]() {
+      writeTimestampProbe(asmFileInfo, timestampRun);
+      timestampRun.clear();
+    };
+
+    while (timestampIndex < timestampLines.size() || taskIndex < tasks.size()) {
+      const bool clockNext = taskIndex < tasks.size() &&
+          (timestampIndex >= timestampLines.size() ||
+           tasks[taskIndex].line <= static_cast<int>(timestampLines[timestampIndex]));
+      if (clockNext) {
+        flushTimestampRun();
+        writeClockProbe(asmFileInfo, clockCounters, tasks[taskIndex]);
+        ++taskIndex;
+      } else {
+        timestampRun.push_back(timestampLines[timestampIndex]);
+        ++timestampIndex;
       }
-      ctFile << "}\n\n";
     }
+    flushTimestampRun();
   }
 
   for (const auto& [uc, tasks] : tasksByUc) {
@@ -1495,9 +1536,9 @@ std::vector<CTRegisterWrite> AieDtraceCTWriter::generatePlioPerfCounterConfig(
       ++slot;
     }
     else if (cfg.eventType == "clock") {
-      // Start on PL User Event 0. The jprobe sets the stop event to PERF_CNT_0
+      // Start on PL User Event 1. The jprobe sets the stop event to PERF_CNT_0
       // after writing the next running-count ceiling.
-      setStartOnly(cfg.counterNumber, static_cast<uint8_t>(PL_USER_EVENT_0));
+      setStartOnly(cfg.counterNumber, static_cast<uint8_t>(PL_USER_EVENT_1));
     }
   }
 

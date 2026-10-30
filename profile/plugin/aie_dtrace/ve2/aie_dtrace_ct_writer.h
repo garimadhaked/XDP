@@ -359,7 +359,7 @@ private:
    * PLIO columns and south channels come from plip_info.json (via metadata), not
    * the partition shim columns. Each selected south port gets running and
    * stalled event counts on counters 0 and 1 (start event == stop event).
-   * Counter 2 counts clocks: begin arms its start on PL User Event 0 and
+   * Counter 2 counts clocks: begin arms its start on PL User Event 1 and
    * resets it once. Each pl_wts.json jprobe sets counter 0's event-value to
    * the next cumulative byte ceiling and sets counter 2's stop event to
    * PERF_CNT_0, then generates the user event.
@@ -387,9 +387,12 @@ private:
   std::vector<CTRegisterWrite> generatePlioPerfCounterConfig(uint8_t column,
       const std::vector<BandwidthCounterConfig>& configs);
 
-  // Task jprobes. Each one writes the next running-count ceiling into counter 0's
-  // event-value register, points counter 2's stop event at PERF_CNT_0, then
-  // generates PL User Event 0. One block per pl_wts_config_lines entry.
+  // Timestamp reads and PLIO clock-stop writes, one control program at a time.
+  // The dtrace runtime follows jprobes only while their asm lines stay
+  // ascending, so the two probe kinds are interleaved by line. A clock-stop
+  // probe writes counter 0's event-value ceiling, points counter 2's stop at
+  // PERF_CNT_0, then generates PL User Event 1. On a shared line it is emitted
+  // before the timestamp read.
   void writePlioReadWindowProbes(std::ofstream& ctFile,
       const std::vector<ASMFileInfo>& asmFileInfoList);
 
@@ -759,7 +762,7 @@ private:
 
   // PLIO read: running and stalled per south port, start event == stop event.
   // The first port uses counters 0 and 1. Counter 2 counts clocks from PL User
-  // Event 0 until the running counter reaches the current byte ceiling. A
+  // Event 1 until the running counter reaches the current byte ceiling. A
   // second port uses counters 3 and 4.
   static constexpr uint8_t PLIO_COUNTERS_PER_STREAM = 2;
   static constexpr uint8_t MAX_PLIO_STREAM_PORTS = 2;
@@ -767,13 +770,13 @@ private:
 
   // AIE2PS shim PL module. Event generate is what XAie_EventGenerate writes
   // for XAIE_PL_MOD (XAIE2PSGBL_PL_MODULE_EVENT_GENERATE). The value is
-  // XAIE2PS_EVENTS_PL_USER_EVENT_0. Counter 0's event-value register
+  // XAIE2PS_EVENTS_PL_USER_EVENT_1. Counter 0's event-value register
   // (XAIE2PSGBL_PL_MODULE_PERFORMANCE_COUNTER0_EVENT_VALUE) generates
   // XAIE2PS_EVENTS_PL_PERF_CNT_0 when the running count reaches it. That event
   // is counter 2's stop. Performance_Ctrl2 holds counter 2's start and stop
   // in bits [7:0] and [15:8]; counter 3 occupies the upper half.
   static constexpr uint64_t PL_EVENT_GENERATE_OFFSET = 0x00034008;
-  static constexpr uint32_t PL_USER_EVENT_0 = 182;
+  static constexpr uint32_t PL_USER_EVENT_1 = 183;
   static constexpr uint32_t PL_PERF_CNT_0 = 5;
   static constexpr uint64_t PL_PERF_COUNTER0_EVENT_VALUE_OFFSET = 0x00031080;
   static constexpr uint64_t PL_PERF_CTRL2_OFFSET = 0x0003100C;

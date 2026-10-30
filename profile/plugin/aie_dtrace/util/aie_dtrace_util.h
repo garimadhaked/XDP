@@ -28,7 +28,7 @@ namespace xdp::aie::dtrace {
   bool isPlioBandwidthMetric(const std::string& metricSet);
 
   // One task jprobe for a control program: the asm line that generates PL User
-  // Event 0, and the clock-counter stop threshold in effect at that line.
+  // Event 1, and the clock-counter stop threshold in effect at that line.
   struct PlWtsProbe {
     int line = 0;
     uint32_t stopCount = 0;
